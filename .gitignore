@@ -1,0 +1,29 @@
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE settings
+.idea/
+.vscode/
+
+# Sensitive credentials & environment
+.env
+service_account.json
+
+# Local database/data/logs/dumps
+*.json
+*.txt
+*.csv
+*.xlsx
+*.log
+data/
+
+# Agent files
+.agent/
