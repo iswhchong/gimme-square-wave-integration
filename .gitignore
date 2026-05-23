@@ -28,5 +28,7 @@ data/
 # Whitelist requirements.txt
 !requirements.txt
 
-# Agent files
-.agent/
+# Agent files configuration
+.agent/*
+!.agent/rules/
+!.agent/workflows/
