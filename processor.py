@@ -27,133 +27,176 @@ class Processor:
             }
         }
 
+        # 1. Fetch source orders for any refunds to determine their original tender types
+        from square_client import SquareClient
+        sq = SquareClient()
+        source_order_ids = set()
+        
         for order in orders:
-            # 1. Tenders (How it was paid)
-            tenders = order.get('tenders', [])
-            total_money = order.get('total_money', {'amount': 0})
-            order_total = float(total_money['amount']) / 100.0
+            if order.get('state') != 'COMPLETED':
+                continue
             
-            # Filter OUT unpaid/canceled orders just in case, though we filtered by COMPLETED
-            if order['state'] != 'COMPLETED':
+            # If it's a refund and doesn't have local tenders, look up source orders
+            net_amounts = order.get('net_amounts', {})
+            net_total_money = float(net_amounts.get('total_money', {}).get('amount', 0))
+            returns = order.get('returns', [])
+            is_refund = net_total_money < 0 or (net_total_money == 0 and len(returns) > 0)
+            
+            if is_refund and not order.get('tenders'):
+                for r in returns:
+                    sid = r.get('source_order_id')
+                    if sid:
+                        source_order_ids.add(sid)
+
+        # Retrieve source orders and build tender type map
+        tender_type_map = {} # (order_id, tender_id) -> type
+        if source_order_ids:
+            try:
+                source_orders = sq.batch_retrieve_orders(list(source_order_ids))
+                for so in source_orders:
+                    so_id = so.get('id')
+                    for t in so.get('tenders', []):
+                        tid = t.get('id')
+                        ttype = t.get('type')
+                        if ttype == 'CARD':
+                            brand = t.get('card_details', {}).get('card', {}).get('card_brand')
+                            if brand == 'SQUARE_GIFT_CARD':
+                                ttype = 'SQUARE_GIFT_CARD'
+                        tender_type_map[(so_id, tid)] = ttype
+            except Exception as e:
+                print(f"Warning: Failed to retrieve source orders for refund tender mapping: {e}")
+
+        # 2. Process all orders
+        for order in orders:
+            if order.get('state') != 'COMPLETED':
                 continue
 
-            summary['total_collected'] += order_total
+            # --- Financial Totals (Net after returns/refunds) ---
+            net_amounts = order.get('net_amounts', {})
+            net_total = float(net_amounts.get('total_money', {}).get('amount', 0)) / 100.0
+            net_tax = float(net_amounts.get('tax_money', {}).get('amount', 0)) / 100.0
+            net_tip = float(net_amounts.get('tip_money', {}).get('amount', 0)) / 100.0
 
-            for tender in tenders:
-                tender_type = tender['type']
-                amt = float(tender['amount_money']['amount']) / 100.0
-                
-                if tender_type == 'CASH':
-                    summary['tenders']['cash'] += amt
-                elif tender_type == 'SQUARE_GIFT_CARD':
-                    summary['tenders']['gift_card'] += amt
-                elif tender_type == 'CARD':
-                    summary['tenders']['card'] += amt
-                else:
-                    summary['tenders']['other'] += amt
+            summary['total_collected'] += net_total
+            summary['tax'] += net_tax
+            summary['tips'] += net_tip
 
-            # 2. Line Items (Sales Mapping)
+            # --- Sales & Returns Items ---
+            # Add sales from line_items
             line_items = order.get('line_items', [])
             for item in line_items:
-                # Gross Sales
-                gross_money = item.get('gross_sales_money', {'amount': 0})
-                gross_amount = float(gross_money['amount']) / 100.0
-                
-                # Determine Category/Mapping
-                # Try Item Mapping first? No, we rely on Category Name
-                cat_id = item.get('catalog_object_id') # This is Item ID, not Category
-                # We typically need to look up the Item's Category.
-                # Since 'line_items' in Order object doesn't always contain category_name directly unless expanded?
-                # Actually, Square SearchOrders response includes 'catalog_object_id' and 'item_type'.
-                # To get Category, we might need to fetch Catalog or assume 'name' mapping if config relies on names.
-                # However, the user provided 'Food & Snack' etc.
-                # Square Order Line Item usually has 'name'. We can map based on Name if Category is missing?
-                # User config maps 'Square Category Names' to Account IDs. 
-                # !!! Square Orders don't always have Category Name inline.
-                # BUT, variation_name or name is there.
-                # Wait, the config uses specific Category Names "Drinks", "Memberships".
-                # We need to map OrderItem -> Category.
-                # This usually requires a Catalog lookup map (Item ID -> Category Name).
-                # For now, let's try to infer or fallback.
-                
-                # IMPORTANT: We need a way to map Item -> Wave Account.
-                # Current config maps "Category Name" -> "Wave Account".
-                # If we don't have the Category Name in the Order, we are stuck.
-                # Square Orders API 'return_entries' might help?
-                # Or we build a local catalog map from 'square_catalog_full.json' if needed?
-                # For now, let's assume we use the 'name' or 'variation_name' to guess, OR better:
-                # We should have fetched the catalog map in __init__.
-                
-                # Fallback: All 'Sales' to default if logic too complex for first pass?
-                # User requests precise mapping.
-                # Let's use a "Default" income account for now to ensure code runs, 
-                # but ideally we look up the category.
-                
-                # Match Item -> Category -> Wave Account
+                gross_amount = float(item.get('gross_sales_money', {'amount': 0}).get('amount', 0)) / 100.0
+                cat_id = item.get('catalog_object_id')
                 cat_name = self.catalog.get_category_for_item(cat_id)
                 item_name = item.get('name', '')
                 
-                # Special Override: eGift Card (Liability)
                 if "eGift Card" in item_name:
-                     target_acct = self.account_map['gift_card']
+                    target_acct = self.account_map['gift_card']
                 else:
                     target_acct = self.category_map.get(cat_name)
-                    
-                    # If not found by exact category name, try 'Uncategorized' or fallback
                     if not target_acct:
-                         target_acct = self.category_map.get('Uncategorized')
-                         print(f"DEBUG: Unknown Category: {item_name} (Cat: {cat_name}) - Using Uncategorized")
-                    elif target_acct == "WAVE_ACCOUNT_ID_DEFAULT":
-                         # Default mapping (silent)
-                         pass
-
+                        target_acct = self.category_map.get('Uncategorized')
+                        print(f"DEBUG: Unknown Category: {item_name} (Cat: {cat_name}) - Using Uncategorized")
                 
-                # Add to breakdown
                 if target_acct not in summary['sales_breakdown']:
                     summary['sales_breakdown'][target_acct] = 0.0
                 summary['sales_breakdown'][target_acct] += gross_amount
 
-            # 3. Taxes
-            # Taxes are usually separate from Gross Sales in the 'total_tax_money'
-            tax_money = order.get('total_tax_money', {'amount': 0})
-            summary['tax'] += float(tax_money['amount']) / 100.0
-            
-            # 4. Tips
-            tip_money = order.get('total_tip_money', {'amount': 0})
-            summary['tips'] += float(tip_money['amount']) / 100.0
-            
-            # 5. Discounts
-            discounts = order.get('discounts', [])
-            for disc in discounts:
-                disc_name = disc.get('name', 'Default')
-                disc_applied = float(disc['applied_money']['amount']) / 100.0
+            # Subtract returns from line items
+            returns = order.get('returns', [])
+            for r in returns:
+                for rl in r.get('return_line_items', []):
+                    return_amount = float(rl.get('gross_return_money', {'amount': 0}).get('amount', 0)) / 100.0
+                    cat_id = rl.get('catalog_object_id')
+                    cat_name = self.catalog.get_category_for_item(cat_id)
+                    item_name = rl.get('name', '')
+                    
+                    if "eGift Card" in item_name:
+                        target_acct = self.account_map['gift_card']
+                    else:
+                        target_acct = self.category_map.get(cat_name)
+                        if not target_acct:
+                            target_acct = self.category_map.get('Uncategorized')
+                            print(f"DEBUG: Unknown Return Category: {item_name} (Cat: {cat_name}) - Using Uncategorized")
+                    
+                    if target_acct not in summary['sales_breakdown']:
+                        summary['sales_breakdown'][target_acct] = 0.0
+                    summary['sales_breakdown'][target_acct] -= return_amount
+
+            # --- Tenders (Payments & Refunds) ---
+            tenders = order.get('tenders', [])
+            refunds = order.get('refunds', [])
+
+            # Original payments
+            for t in tenders:
+                amt = float(t.get('amount_money', {}).get('amount', 0)) / 100.0
+                ttype = t.get('type')
+                if ttype == 'CASH':
+                    summary['tenders']['cash'] += amt
+                elif ttype == 'SQUARE_GIFT_CARD':
+                    summary['tenders']['gift_card'] += amt
+                elif ttype == 'CARD':
+                    brand = t.get('card_details', {}).get('card', {}).get('card_brand')
+                    if brand == 'SQUARE_GIFT_CARD':
+                        summary['tenders']['gift_card'] += amt
+                    else:
+                        summary['tenders']['card'] += amt
+                else:
+                    summary['tenders']['other'] += amt
+
+            # Subtract refunds from tenders
+            for ref in refunds:
+                ref_amt = float(ref.get('amount_money', {}).get('amount', 0)) / 100.0
+                tid = ref.get('tender_id')
                 
-                # Lookup Discount Account
-                # Try exact match, then 'Default'
-                disc_acct = self.discount_map.get(disc_name, self.discount_map.get('Default'))
+                # Check source order logic
+                source_oid = None
+                if returns:
+                    source_oid = returns[0].get('source_order_id')
                 
-                # Discounts reduce income, but in accounting, they are usually:
-                # Debit Constraint-Income (or Expense).
-                # Since we are depositing to AR (Anchor), 
-                # Income (Credit) + Tax (Credit) + Tips (Credit) - Discount (Debit) = AR (Debit)
+                found_type = None
+                if source_oid and tid:
+                    found_type = tender_type_map.get((source_oid, tid))
                 
-                # We'll treat this as a negative entry in sales breakdown or separate bucket?
-                # Wave 'moneyTransaction' needs 'DEPOSIT'/'WITHDRAWAL'.
-                # AR is DEPOSIT.
-                # Income is DEPOSIT to Account? No.
-                # AR (Asset) Increase = Debit. Wave calls this DEPOSIT (to the anchor).
-                # Income (Equity/Rev) Increase = Credit. Wave calls this ? ("INCREASE")
+                if not found_type:
+                    # Fallback Heuristics
+                    reason = ref.get('reason', '').lower()
+                    if "change" in reason or "cash" in reason:
+                        found_type = 'CASH'
+                    else:
+                        # Default fallback
+                        found_type = 'CARD'
                 
-                # Let's accumulate discounts separately to handle later
-                # We can add them to 'sales_breakdown' as negative? NO, different account.
-                
-                # We need a 'discounts_breakdown'
-                if 'discounts_breakdown' not in summary:
-                    summary['discounts_breakdown'] = {}
-                
-                if disc_acct not in summary['discounts_breakdown']:
-                    summary['discounts_breakdown'][disc_acct] = 0.0
-                summary['discounts_breakdown'][disc_acct] += disc_applied
+                if found_type == 'CASH':
+                    summary['tenders']['cash'] -= ref_amt
+                elif found_type == 'SQUARE_GIFT_CARD':
+                    summary['tenders']['gift_card'] -= ref_amt
+                elif found_type == 'CARD':
+                    summary['tenders']['card'] -= ref_amt
+                else:
+                    summary['tenders']['other'] -= ref_amt
+
+            # --- Discounts ---
+            if config.AGGREGATE_DISCOUNTS:
+                net_disc_money = float(net_amounts.get('discount_money', {}).get('amount', 0)) / 100.0
+                if net_disc_money != 0:
+                    disc_acct = self.discount_map.get('Default')
+                    if 'discounts_breakdown' not in summary:
+                        summary['discounts_breakdown'] = {}
+                    if disc_acct not in summary['discounts_breakdown']:
+                        summary['discounts_breakdown'][disc_acct] = 0.0
+                    summary['discounts_breakdown'][disc_acct] += net_disc_money
+            else:
+                discounts = order.get('discounts', [])
+                for disc in discounts:
+                    disc_name = disc.get('name', 'Default')
+                    disc_applied = float(disc['applied_money']['amount']) / 100.0
+                    disc_acct = self.discount_map.get(disc_name, self.discount_map.get('Default'))
+                    if 'discounts_breakdown' not in summary:
+                        summary['discounts_breakdown'] = {}
+                    if disc_acct not in summary['discounts_breakdown']:
+                        summary['discounts_breakdown'][disc_acct] = 0.0
+                    summary['discounts_breakdown'][disc_acct] += disc_applied
 
         return summary
 
