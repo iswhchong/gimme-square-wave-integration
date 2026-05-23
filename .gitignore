@@ -25,5 +25,8 @@ service_account.json
 *.log
 data/
 
+# Whitelist requirements.txt
+!requirements.txt
+
 # Agent files
 .agent/
