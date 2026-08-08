@@ -1,7 +1,7 @@
 import requests
 import config
 import json
-from datetime import datetime
+import hashlib
 
 class WaveClient:
     def __init__(self):
@@ -62,10 +62,32 @@ class WaveClient:
                 "balance": item['direction'] 
             })
 
+        # Deterministic fallback external id. Previously this used
+        # datetime.now(), which changed every run and defeated idempotency —
+        # re-running a day posted duplicate transactions. If no external id is
+        # supplied, derive one from the transaction's content so identical
+        # re-posts carry an identical id. Callers should still pass an explicit
+        # external_id (see idempotency.deterministic_external_id).
+        if not external_id:
+            _material = json.dumps(
+                {
+                    "date": date_str,
+                    "description": description,
+                    "amount": fmt_amount,
+                    "anchor": anchor_account_id,
+                    "direction": anchor_direction,
+                    "lines": sorted(
+                        (l["accountId"], l["balance"], l["amount"]) for l in gql_lines
+                    ),
+                },
+                sort_keys=True,
+            )
+            external_id = "SQ_" + hashlib.sha256(_material.encode("utf-8")).hexdigest()[:24]
+
         variables = {
             "input": {
                 "businessId": self.business_id,
-                "externalId": external_id or f"SQ_TX_{date_str.replace('-','')}_{int(datetime.now().timestamp())}",
+                "externalId": external_id,
                 "date": date_str,
                 "description": description,
                 "anchor": {

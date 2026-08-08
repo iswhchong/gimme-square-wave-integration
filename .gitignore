@@ -19,14 +19,17 @@ service_account.json
 
 # Local database/data/logs/dumps
 *.json
+*.jsonl
 *.txt
 *.csv
 *.xlsx
 *.log
 data/
+logs/
 
 # Whitelist requirements.txt
 !requirements.txt
+!requirements-dev.txt
 
 # Agent files configuration
 .agent/*
