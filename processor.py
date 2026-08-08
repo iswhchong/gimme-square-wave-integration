@@ -3,11 +3,27 @@ from datetime import datetime
 from catalog_manager import CatalogManager
 
 class Processor:
-    def __init__(self):
+    def __init__(self, catalog=None, square_client=None):
+        """
+        :param catalog: optional CatalogManager (or compatible object exposing
+            get_category_for_item). Injectable for offline testing. Defaults to
+            the file-backed CatalogManager (previous behavior).
+        :param square_client: optional SquareClient used only to look up source
+            orders for refunds that lack local tenders. Injectable for offline
+            testing. Created lazily on first use if not provided.
+        """
         self.category_map = config.ITEM_CATEGORY_MAPPING
         self.discount_map = config.DISCOUNT_MAPPING
         self.account_map = config.ACCOUNT_MAPPING
-        self.catalog = CatalogManager() # Initialize catalog lookup
+        self.catalog = catalog if catalog is not None else CatalogManager() # Initialize catalog lookup
+        self._square_client = square_client
+
+    def _get_square_client(self):
+        """Lazily obtain a SquareClient, only when refund source lookups are needed."""
+        if self._square_client is None:
+            from square_client import SquareClient
+            self._square_client = SquareClient()
+        return self._square_client
 
     def aggregate_daily_orders(self, orders, date_str):
         """
@@ -28,8 +44,6 @@ class Processor:
         }
 
         # 1. Fetch source orders for any refunds to determine their original tender types
-        from square_client import SquareClient
-        sq = SquareClient()
         source_order_ids = set()
         
         for order in orders:
@@ -52,6 +66,7 @@ class Processor:
         tender_type_map = {} # (order_id, tender_id) -> type
         if source_order_ids:
             try:
+                sq = self._get_square_client()
                 source_orders = sq.batch_retrieve_orders(list(source_order_ids))
                 for so in source_orders:
                     so_id = so.get('id')
@@ -314,6 +329,7 @@ class Processor:
         
         payloads.append({
             "type": "sales_journal",
+            "role": "sales_journal",
             "date": date,
             "description": f"Sales - {desc_date} - Square",
             "amount": actual_anchor, # Use the actual collected as anchor
@@ -326,6 +342,7 @@ class Processor:
         if cash_amt > 0:
             payloads.append({
                 "type": "transfer",
+                "role": "transfer_cash",
                 "date": date,
                 "description": f"Sales - {desc_date} - Cash Register",
                 "anchor_id": self.account_map['cash'],
@@ -347,6 +364,7 @@ class Processor:
         if gc_amt > 0:
             payloads.append({
                 "type": "transfer",
+                "role": "transfer_gift_card",
                 "date": date,
                 "description": f"Sales - {desc_date} - Gift Card",
                 "anchor_id": self.account_map['cash'], # Anchor on Asset (Cash Register)
