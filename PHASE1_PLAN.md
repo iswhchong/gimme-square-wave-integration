@@ -1,5 +1,10 @@
 # Phase 1 — Harden Square Sales → Wave
 
+> **Status (2026-08-08):** W1 idempotency done (PR #1). W2 structured logging &
+> audit done. W3 robustness/retries + rounding-fudge fix done. W4
+> prepare-then-approve gate done. W5 testing runs alongside each PR (31 offline
+> tests green). Remaining: Kent's live dry-run → single real day → reconcile in Wave.
+
 **Goal:** make the existing daily sales pipeline robust, idempotent, logged, and safe to
 re-run — satisfying the charter's core principles (*prepare-then-approve*, *idempotent &
 auditable*, *reconciliation-first*) before we automate anything new.

@@ -2,6 +2,10 @@ import requests
 import config
 import json
 import hashlib
+from logging_setup import get_logger
+from http_util import post_with_retry
+
+logger = get_logger("wave_client")
 
 class WaveClient:
     def __init__(self):
@@ -23,11 +27,11 @@ class WaveClient:
         :param anchor_direction: 'DEPOSIT' or 'WITHDRAWAL'. 
         :param anchor_account_id: ID of the anchor account. Defaults to Clearing Account if None.
         """
-        # ... (logging)
-        print(f"Creating Wave transaction ({anchor_direction}) on {anchor_account_id or 'Default'}: {description} on {date_str}...")
-        
+        logger.info("Creating Wave transaction (%s) on %s: %s on %s...",
+                    anchor_direction, anchor_account_id or "Default", description, date_str)
+
         if not line_items:
-            print("No line items provided. Skipping.")
+            logger.warning("No line items provided for '%s' on %s. Skipping.", description, date_str)
             return None
 
         # Determine Anchor Account from config (Clearing Account) if not provided
@@ -99,22 +103,26 @@ class WaveClient:
             }
         }
         
-        response = requests.post(self.url, json={"query": mutation, "variables": variables}, headers=self.headers)
+        response = post_with_retry(self.url, json={"query": mutation, "variables": variables}, headers=self.headers)
 
-        
+
         if response.status_code == 200:
             res_data = response.json()
             if 'errors' in res_data:
-                 print("GraphQL Error:", res_data['errors'])
+                 logger.error("GraphQL error posting '%s' (%s): %s",
+                              description, external_id, res_data['errors'])
                  return None
-            
+
             result = res_data['data']['moneyTransactionCreate']
             if result['didSucceed']:
-                print(f"Success! Transaction ID: {result['transaction']['id']}")
-                return result['transaction']['id']
+                tx_id = result['transaction']['id']
+                logger.info("Wave transaction created: %s (external_id=%s)", tx_id, external_id)
+                return tx_id
             else:
-                print("Transaction Failed:", result['inputErrors'])
+                logger.error("Wave rejected transaction '%s' (%s): %s",
+                             description, external_id, result['inputErrors'])
                 return None
         else:
-            print(f"HTTP Request Failed: {response.status_code} {response.text}")
+            logger.error("Wave HTTP request failed (%s) for '%s': %s",
+                         response.status_code, external_id, response.text)
             return None
