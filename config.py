@@ -66,3 +66,9 @@ DISCOUNT_MAPPING = {
 # Mapping Logic Configuration
 # If true, all discounts are aggregated to the 'discounts' account above.
 AGGREGATE_DISCOUNTS = True
+
+# Largest acceptable double-entry gap (in dollars) between Square's reported
+# total collected and the sum of the computed credit lines. Gaps at or below
+# this are absorbed into the largest sales line as a rounding artifact (and
+# logged); larger gaps raise a ReconciliationError instead of being fudged.
+ROUNDING_TOLERANCE = 0.05

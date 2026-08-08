@@ -1,10 +1,14 @@
 import requests
 import config
 from datetime import datetime, timedelta
+from logging_setup import get_logger
+from http_util import post_with_retry
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     import pytz as ZoneInfo # fallback if somehow old python
+
+logger = get_logger("square_client")
 
 class SquareClient:
     def __init__(self):
@@ -24,7 +28,7 @@ class SquareClient:
         Fetch orders for a date range.
         Dates should be in 'YYYY-MM-DD' format.
         """
-        print(f"Fetching Square orders from {start_date_str} to {end_date_str}...")
+        logger.info("Fetching Square orders from %s to %s...", start_date_str, end_date_str)
         
         # Convert to ISO format with timezone (UTC is standard for API, but we'll use local day boundaries if possible)
         # Square SearchOrders expects RFC 3339 format
@@ -71,10 +75,10 @@ class SquareClient:
             if cursor:
                 payload["cursor"] = cursor
             
-            response = requests.post(url, json=payload, headers=self.headers)
-            
+            response = post_with_retry(url, json=payload, headers=self.headers)
+
             if response.status_code != 200:
-                print(f"Error fetching orders: {response.text}")
+                logger.error("Error fetching orders (%s): %s", response.status_code, response.text)
                 response.raise_for_status()
                 
             data = response.json()
@@ -85,7 +89,7 @@ class SquareClient:
             if not cursor:
                 break
                 
-        print(f"Total orders found: {len(all_orders)}")
+        logger.info("Total orders found: %d", len(all_orders))
         return all_orders
 
     def batch_retrieve_orders(self, order_ids):
@@ -95,7 +99,7 @@ class SquareClient:
         if not order_ids:
             return []
             
-        print(f"Batch retrieving {len(order_ids)} orders...")
+        logger.info("Batch retrieving %d orders...", len(order_ids))
         url = f"{self.base_url}/orders/batch-retrieve"
         
         all_orders = []
@@ -108,9 +112,9 @@ class SquareClient:
                 "order_ids": chunk
             }
             
-            response = requests.post(url, json=payload, headers=self.headers)
+            response = post_with_retry(url, json=payload, headers=self.headers)
             if response.status_code != 200:
-                print(f"Error batch retrieving: {response.text}")
+                logger.error("Error batch retrieving (%s): %s", response.status_code, response.text)
                 continue
                 
             data = response.json()

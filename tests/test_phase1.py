@@ -190,7 +190,7 @@ def test_wave_client_fallback_external_id_is_deterministic(monkeypatch):
             return {"data": {"moneyTransactionCreate": {
                 "didSucceed": True, "transaction": {"id": "TX"}}}}
 
-    def fake_post(url, json=None, headers=None):
+    def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
         captured.setdefault("external_ids", []).append(
             json["variables"]["input"]["externalId"])
         return FakeResp()

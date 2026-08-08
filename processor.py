@@ -1,6 +1,14 @@
 import config
 from datetime import datetime
 from catalog_manager import CatalogManager
+from logging_setup import get_logger
+from errors import ReconciliationError
+
+logger = get_logger("processor")
+
+# Fallback if config doesn't define one. Largest double-entry gap we'll absorb
+# as a rounding artifact; above this we refuse rather than fudge.
+_DEFAULT_ROUNDING_TOLERANCE = 0.05
 
 class Processor:
     def __init__(self, catalog=None, square_client=None):
@@ -40,7 +48,10 @@ class Processor:
                 "gift_card": 0.0,
                 "card": 0.0,
                 "other": 0.0
-            }
+            },
+            # Audit trail (Workstream 2): the Square order ids that fed this
+            # day's aggregate, so every Wave posting is traceable to its sources.
+            "source_order_ids": [],
         }
 
         # 1. Fetch source orders for any refunds to determine their original tender types
@@ -79,12 +90,17 @@ class Processor:
                                 ttype = 'SQUARE_GIFT_CARD'
                         tender_type_map[(so_id, tid)] = ttype
             except Exception as e:
-                print(f"Warning: Failed to retrieve source orders for refund tender mapping: {e}")
+                logger.warning("Failed to retrieve source orders for refund tender mapping: %s", e)
 
         # 2. Process all orders
         for order in orders:
             if order.get('state') != 'COMPLETED':
                 continue
+
+            # Record the source order id for the audit trail.
+            oid = order.get('id')
+            if oid:
+                summary['source_order_ids'].append(oid)
 
             # --- Financial Totals (Net after returns/refunds) ---
             net_amounts = order.get('net_amounts', {})
@@ -111,8 +127,9 @@ class Processor:
                     target_acct = self.category_map.get(cat_name)
                     if not target_acct:
                         target_acct = self.category_map.get('Uncategorized')
-                        print(f"DEBUG: Unknown Category: {item_name} (Cat: {cat_name}) - Using Uncategorized")
-                
+                        logger.warning("Unknown category for sale item '%s' (cat=%s) -> Uncategorized",
+                                       item_name, cat_name)
+
                 if target_acct not in summary['sales_breakdown']:
                     summary['sales_breakdown'][target_acct] = 0.0
                 summary['sales_breakdown'][target_acct] += gross_amount
@@ -132,7 +149,8 @@ class Processor:
                         target_acct = self.category_map.get(cat_name)
                         if not target_acct:
                             target_acct = self.category_map.get('Uncategorized')
-                            print(f"DEBUG: Unknown Return Category: {item_name} (Cat: {cat_name}) - Using Uncategorized")
+                            logger.warning("Unknown category for return item '%s' (cat=%s) -> Uncategorized",
+                                           item_name, cat_name)
                     
                     if target_acct not in summary['sales_breakdown']:
                         summary['sales_breakdown'][target_acct] = 0.0
@@ -310,19 +328,41 @@ class Processor:
         actual_anchor = fmt_money(summary['total_collected'])
         
         diff = round(actual_anchor - calculated_anchor, 2)
-        
-        # Adjust if mismatch due to rounding (usually 0.01)
+
+        # Reconcile a mismatch between what Square says was collected and the
+        # sum of the credit lines. A sub-tolerance gap is a genuine rounding
+        # artifact and we absorb it into the largest sales line (logged, not
+        # silent). A larger gap means the books wouldn't balance for a real
+        # reason — quietly moving dollars would corrupt them, so we refuse.
+        tolerance = getattr(config, "ROUNDING_TOLERANCE", _DEFAULT_ROUNDING_TOLERANCE)
         if diff != 0:
-            print(f"Rounding discrepancy detected: {diff}. Adjusting largest sales item.")
-            # Find largest sales item to adjust
+            if abs(diff) > tolerance:
+                logger.error(
+                    "Reconciliation gap $%.2f exceeds tolerance $%.2f for %s "
+                    "(credits=$%.2f vs collected=$%.2f). Refusing to auto-adjust.",
+                    diff, tolerance, date, calculated_anchor, actual_anchor,
+                )
+                raise ReconciliationError(
+                    f"{date}: sales journal off by ${diff:.2f} "
+                    f"(credits ${calculated_anchor:.2f} vs collected ${actual_anchor:.2f}); "
+                    f"exceeds ${tolerance:.2f} tolerance."
+                )
             if sales_items:
-                # Sort by amount desc
                 sales_items.sort(key=lambda x: x['amount'], reverse=True)
-                sales_items[0]['amount'] = round(sales_items[0]['amount'] + diff, 2)
-                # Re-calculate total_credits just to be sure (mentally)
+                before = sales_items[0]['amount']
+                sales_items[0]['amount'] = round(before + diff, 2)
+                logger.warning(
+                    "Absorbed rounding gap $%.2f into largest sales line "
+                    "(acct %s: $%.2f -> $%.2f) for %s",
+                    diff, sales_items[0]['account_id'], before, sales_items[0]['amount'], date,
+                )
             else:
-                # If no sales items? Unusual. Adjust Tax?
-                pass
+                logger.error(
+                    "Rounding gap $%.2f for %s but no sales line to absorb it.", diff, date,
+                )
+                raise ReconciliationError(
+                    f"{date}: ${diff:.2f} rounding gap with no sales line to absorb it."
+                )
         
         # Combine lines
         lines = sales_items + discount_items
@@ -376,5 +416,12 @@ class Processor:
                     "direction": "DECREASE" # Debit Liability
                 }]
             })
+
+        # Audit trail (Workstream 2): stamp each payload with the day's source
+        # Square order ids so the eventual ledger record ties the Wave posting
+        # back to the exact orders it aggregates.
+        source_ids = summary.get('source_order_ids', [])
+        for p in payloads:
+            p['source_order_ids'] = source_ids
 
         return payloads

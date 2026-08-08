@@ -2,11 +2,15 @@ from square_client import SquareClient
 from wave_client import WaveClient
 from processor import Processor
 import argparse
-import logging
+import os
 import config
 from idempotency import deterministic_external_id, content_hash, PostedLedger
+from logging_setup import setup_logging, get_logger
+from validation import validate_summary, validate_payloads
+from errors import ReconciliationError
+import approval
 
-logger = logging.getLogger("square_to_wave")
+logger = get_logger()
 
 
 def _post_payload_idempotent(wv, payload, ledger, replace=False):
@@ -53,12 +57,24 @@ def _post_payload_idempotent(wv, payload, ledger, replace=False):
     )
 
     if tx_id:
+        source_ids = payload.get("source_order_ids", [])
         ledger.record(
             external_id=external_id,
             hash_value=new_hash,
             amount=payload["amount"],
             wave_transaction_id=tx_id,
-            extra={"role": role, "date": payload["date"], "description": payload["description"]},
+            extra={
+                "role": role,
+                "date": payload["date"],
+                "description": payload["description"],
+                "source_order_ids": source_ids,
+            },
+        )
+        # Structured audit record: everything needed to trace this posting back
+        # to its Square sources (Workstream 2).
+        logger.info(
+            "AUDIT posted date=%s role=%s external_id=%s amount=%.2f wave_tx=%s source_orders=%d",
+            payload["date"], role, external_id, float(payload["amount"]), tx_id, len(source_ids),
         )
         logger.info("POSTED %s -> Wave tx %s", external_id, tx_id)
         return "posted"
@@ -66,10 +82,188 @@ def _post_payload_idempotent(wv, payload, ledger, replace=False):
     logger.error("FAILED to post %s (Wave returned no transaction id)", external_id)
     return "failed"
 
+
+def _post_payloads(wv, payloads, ledger, date_str, type_filter=None, replace=False):
+    """
+    Post a list of payloads idempotently, all-or-nothing on hard failure.
+
+    On a failed post we stop rather than leave the day half-posted in an unknown
+    state, logging exactly what already landed so an idempotent re-run resumes
+    cleanly. Returns the outcomes count dict.
+    """
+    outcomes = {}
+    posted_ok = []
+    for p in payloads:
+        if type_filter and p.get("type") != type_filter:
+            continue
+        result = _post_payload_idempotent(wv, p, ledger, replace=replace)
+        outcomes[result] = outcomes.get(result, 0) + 1
+        if result in ("posted", "skipped_duplicate"):
+            posted_ok.append(p.get("role", p.get("type")))
+        elif result == "failed":
+            logger.error(
+                "Payload '%s' failed to post for %s. Stopping. "
+                "Already durable this run: %s. Re-run the same date to resume.",
+                p.get("role", p.get("type")), date_str, ", ".join(posted_ok) or "none",
+            )
+            break
+
+    logger.info("Run complete for %s: %s", date_str,
+                ", ".join(f"{k}={v}" for k, v in sorted(outcomes.items())) or "nothing to post")
+    if outcomes.get("skipped_changed"):
+        logger.warning("Some payloads changed since a prior post and were NOT updated. "
+                       "Review, then re-run with --replace if the new figures are correct.")
+    return outcomes
+
+
+def post_approved(wv, artifact, ledger, type_filter=None, replace=False):
+    """
+    Post the payloads carried in an APPROVED artifact.
+
+    The gate: refuse unless the artifact is approved and its integrity
+    fingerprint still matches its payloads. Returns the outcomes dict, or None
+    if the gate rejected the artifact.
+    """
+    ok, msg = approval.check_postable(artifact)
+    if not ok:
+        logger.error("Approval gate rejected posting for %s: %s", artifact.get("date"), msg)
+        return None
+    logger.info("Approval gate passed for %s (approved by %s at %s).",
+                artifact.get("date"), artifact.get("approved_by"), artifact.get("approved_at_utc"))
+    return _post_payloads(wv, artifact.get("payloads", []), ledger,
+                          artifact.get("date"), type_filter=type_filter, replace=replace)
+
+
+def _fetch_aggregate_prepare(date_str):
+    """
+    Fetch a day from Square, aggregate, log the summary, validate, and prepare
+    Wave payloads. Returns (summary, payloads) or (None, None) if the day should
+    not proceed (no orders, unbalanced, or a blocking validation error).
+    """
+    sq = SquareClient()
+    orders = sq.fetch_orders(date_str, date_str)
+    if not orders:
+        logger.warning("No orders found for %s. Nothing to do.", date_str)
+        return None, None
+
+    proc = Processor()
+    summary = proc.aggregate_daily_orders(orders, date_str)
+
+    logger.info("--- Daily Summary for %s ---", date_str)
+    logger.info("Total Collected: $%.2f", summary['total_collected'])
+    logger.info("Tax: $%.2f  Tips: $%.2f", summary['tax'], summary['tips'])
+    logger.info("Source orders aggregated: %d", len(summary.get('source_order_ids', [])))
+    for acct, amt in summary['sales_breakdown'].items():
+        logger.info("  Sales acct %s: $%.2f", acct, amt)
+    for curr, amt in summary['tenders'].items():
+        logger.info("  Tender %s: $%.2f", curr, amt)
+
+    summary_errors, _ = validate_summary(summary)
+
+    try:
+        payloads = proc.prepare_wave_transactions(summary)
+    except ReconciliationError as e:
+        logger.error("Aborting %s: %s", date_str, e)
+        return None, None
+
+    payload_errors = validate_payloads(payloads)
+    blocking = summary_errors + payload_errors
+    if blocking:
+        logger.error("%d validation issue(s) found for %s: %s",
+                      len(blocking), date_str, "; ".join(blocking))
+        logger.error("Refusing to proceed with %s until the above are resolved.", date_str)
+        return None, None
+
+    return summary, payloads
+
+
+# ---------------------------------------------------------------------------
+# Modes
+# ---------------------------------------------------------------------------
+
+def run_dry_run(date_str):
+    summary, payloads = _fetch_aggregate_prepare(date_str)
+    if payloads is None:
+        return
+    logger.info("[DRY RUN] Would create the following Wave transactions:")
+    for p in payloads:
+        logger.info("Type: %s, Desc: %s, Amount: %s", p['type'], p['description'], p['amount'])
+        if 'anchor_id' in p:
+            logger.info("   Anchor: %s (%s)", p['anchor_id'], p['anchor_direction'])
+        for l in p['lines']:
+            logger.info("   -> Line: %s $%s (Acct: %s)", l['direction'], l['amount'], l['account_id'])
+
+
+def run_prepare(date_str, approval_file):
+    summary, payloads = _fetch_aggregate_prepare(date_str)
+    if payloads is None:
+        return
+    artifact = approval.build_artifact(date_str, summary, payloads,
+                                       location_id=config.SQUARE_LOCATION_ID)
+    approval.write_artifact(approval_file, artifact)
+    for line in approval.render_summary(artifact):
+        logger.info(line)
+    logger.info("Prepared approval artifact -> %s (NOT approved, NOT posted).", approval_file)
+    logger.info("Review it, then approve with:  --approve --approval-file %s", approval_file)
+    logger.info("After approval, post with:      --post --approval-file %s", approval_file)
+
+
+def run_approve(approval_file, approver):
+    if not os.path.exists(approval_file):
+        logger.error("Approval file not found: %s (run --prepare first).", approval_file)
+        return
+    artifact = approval.load_artifact(approval_file)
+    ok, msg, artifact = approval.approve(artifact, approver)
+    if not ok:
+        logger.error("Cannot approve %s: %s", approval_file, msg)
+        return
+    approval.write_artifact(approval_file, artifact)
+    for line in approval.render_summary(artifact):
+        logger.info(line)
+    logger.info("Approved %s by %s. Post with:  --post --approval-file %s",
+                approval_file, artifact["approved_by"], approval_file)
+
+
+def run_post(approval_file, ledger_path, type_filter, replace):
+    if not os.path.exists(approval_file):
+        logger.error("Approval file not found: %s (run --prepare and --approve first).", approval_file)
+        return
+    artifact = approval.load_artifact(approval_file)
+    wv = WaveClient()
+    ledger = PostedLedger(ledger_path)
+    logger.info("--- Posting approved artifact %s to Wave ---", approval_file)
+    post_approved(wv, artifact, ledger, type_filter=type_filter, replace=replace)
+
+
+def run_force_oneshot(date_str, ledger_path, type_filter, replace):
+    logger.warning("FORCE one-shot post for %s: bypassing the prepare-then-approve gate. "
+                   "Use --prepare/--approve/--post for the audited path.", date_str)
+    summary, payloads = _fetch_aggregate_prepare(date_str)
+    if payloads is None:
+        return
+    wv = WaveClient()
+    ledger = PostedLedger(ledger_path)
+    logger.info("--- Posting to Wave (force one-shot) ---")
+    _post_payloads(wv, payloads, ledger, date_str, type_filter=type_filter, replace=replace)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Square to Wave Integration")
-    parser.add_argument("--date", help="Date to process (YYYY-MM-DD)", required=True)
-    parser.add_argument("--dry-run", action="store_true", help="Calculate but do not post to Wave")
+    parser.add_argument("--date", help="Date to process (YYYY-MM-DD)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Calculate and log the day; post nothing, write no artifact.")
+    parser.add_argument("--prepare", action="store_true",
+                        help="Prepare an approval artifact for the date (default action). Posts nothing.")
+    parser.add_argument("--approve", action="store_true",
+                        help="Approve an existing approval artifact (--approval-file).")
+    parser.add_argument("--post", action="store_true",
+                        help="Post the payloads from an APPROVED approval artifact (--approval-file).")
+    parser.add_argument("--force-oneshot", action="store_true",
+                        help="Legacy: fetch, prepare and post in one shot, bypassing the approval gate.")
+    parser.add_argument("--approval-file", default=None,
+                        help="Path to the approval artifact. Defaults to logs/approval_<YYYYMMDD>.json.")
+    parser.add_argument("--approver", default=None,
+                        help="Name recorded as the approver (defaults to the OS user).")
     parser.add_argument("--type", help="Filter transaction type (sales_journal, transfer)", default=None)
     parser.add_argument("--replace", action="store_true",
                         help="If a day was already posted but its amounts have since changed, supersede the previous post instead of refusing.")
@@ -77,61 +271,50 @@ def main():
                         help="Path to the append-only posted-transactions ledger.")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log_path = setup_logging()
 
-    date_str = args.date
-    
-    # 1. Fetch
-    sq = SquareClient()
-    orders = sq.fetch_orders(date_str, date_str)
-    
-    if not orders:
-        print(f"No orders found for {date_str}.")
+    # Resolve the approval file path (needs a date if not given explicitly).
+    approval_file = args.approval_file
+    if approval_file is None and args.date:
+        approval_file = approval.default_artifact_path(args.date)
+
+    approver = args.approver or os.getenv("USER") or os.getenv("USERNAME") or "unknown"
+
+    # Resolve mode. Default (nothing chosen) is the SAFE one: prepare only.
+    if args.approve:
+        mode = "approve"
+    elif args.post:
+        mode = "post"
+    elif args.dry_run:
+        mode = "dry-run"
+    elif args.force_oneshot:
+        mode = "force-oneshot"
+    else:
+        mode = "prepare"  # includes the explicit --prepare and the no-flag default
+
+    logger.info("Run start: mode=%s date=%s type=%s replace=%s approval_file=%s",
+                mode, args.date, args.type, args.replace, approval_file)
+
+    if mode in ("prepare", "dry-run", "force-oneshot") and not args.date:
+        logger.error("--date is required for mode '%s'.", mode)
+        return
+    if mode in ("approve", "post") and not approval_file:
+        logger.error("--approval-file (or --date to derive it) is required for mode '%s'.", mode)
         return
 
-    # 2. Process
-    proc = Processor()
-    summary = proc.aggregate_daily_orders(orders, date_str)
-    
-    print("\n--- Daily Summary ---")
-    print(f"Total Collected: ${summary['total_collected']:.2f}")
-    print(f"Tax: ${summary['tax']:.2f}")
-    print(f"Tips: ${summary['tips']:.2f}")
-    print("Sales Breakdown:")
-    for acct, amt in summary['sales_breakdown'].items():
-        print(f"  - Account {acct}: ${amt:.2f}")
-    print("Tenders:")
-    for curr, amt in summary['tenders'].items():
-        print(f"  - {curr}: ${amt:.2f}")
+    if mode == "dry-run":
+        run_dry_run(args.date)
+    elif mode == "prepare":
+        run_prepare(args.date, approval_file)
+    elif mode == "approve":
+        run_approve(approval_file, approver)
+    elif mode == "post":
+        run_post(approval_file, args.ledger, args.type, args.replace)
+    elif mode == "force-oneshot":
+        run_force_oneshot(args.date, args.ledger, args.type, args.replace)
 
-    # 3. Post
-    payloads = proc.prepare_wave_transactions(summary)
-    
-    if args.dry_run:
-        print("\n[DRY RUN] Would create the following Wave transactions:")
-        for p in payloads:
-            print(f"Type: {p['type']}, Desc: {p['description']}, Amount: {p['amount']}")
-            if 'anchor_id' in p:
-                 print(f"   Anchor: {p['anchor_id']} ({p['anchor_direction']})")
-            for l in p['lines']:
-                print(f"   -> Line: {l['direction']} ${l['amount']} (Acct: {l['account_id']})")
-    else:
-        wv = WaveClient()
-        ledger = PostedLedger(args.ledger)
-        print("\n--- Posting to Wave ---")
-        outcomes = {}
-        for p in payloads:
-            if args.type and p['type'] != args.type:
-                continue
+    logger.info("Run log written to %s", log_path)
 
-            result = _post_payload_idempotent(wv, p, ledger, replace=args.replace)
-            outcomes[result] = outcomes.get(result, 0) + 1
-
-        logger.info("Run complete for %s: %s", date_str,
-                    ", ".join(f"{k}={v}" for k, v in sorted(outcomes.items())) or "nothing to post")
-        if outcomes.get("skipped_changed"):
-            logger.warning("Some payloads changed since a prior post and were NOT updated. "
-                           "Review, then re-run with --replace if the new figures are correct.")
 
 if __name__ == "__main__":
     main()
