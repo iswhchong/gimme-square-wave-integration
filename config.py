@@ -72,3 +72,25 @@ AGGREGATE_DISCOUNTS = True
 # this are absorbed into the largest sales line as a rounding artifact (and
 # logged); larger gaps raise a ReconciliationError instead of being fudged.
 ROUNDING_TOLERANCE = 0.05
+
+
+# --- Workstream 2: Square Payouts -> Wave -----------------------------------
+# Wave's API cannot create the "Transfer from <bank>" split a payout needs
+# (bank-to-bank transfers aren't in moneyTransactionCreate). So the payout posts
+# the transfer amount to a SUSPENSE account instead; Kent then re-points that one
+# line to "Transfer from Square - Account Receivable" (and fixes the actual date)
+# in Wave. Everything else (fees + GST) posts correctly and needs no adjustment.
+PAYOUT_ACCOUNTS = {
+    # Bank account the payout cash lands in (asset, anchor / Deposit).
+    "bank": "QWNjb3VudDoxOTMzNjkxNDI2NjM4NDUxNDg4O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Cash on Hand
+    # SUSPENSE placeholder for the "Transfer from Square - A/R" line (Kent edits
+    # this to the real transfer). Defaults to Tee Time (income), the same
+    # placeholder Phase 1 uses for its transfer workaround. Change freely.
+    "suspense": ACCOUNT_MAPPING["tee_time"],  # Tee Time (income) — placeholder only
+    # Credit-card processing fee (expense, GST-exclusive).
+    "cc_fee": "QWNjb3VudDoyMDgyMTA3NDI1NzU3OTA5ODQ5O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Square Transaction Fee
+    # Gift-card processing fee, NET of GST (expense).
+    "gift_card_fee": "QWNjb3VudDoyMjUwMjI4MzcwNzkwOTk0NTE5O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Square - Gift Card Fee
+    # Recoverable GST (Input Tax Credit) on the gift-card fee (asset).
+    "itc": "QWNjb3VudDoxOTMzNjkxNDI2NzcyNjY5MjIwO0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Taxes Recoverable/Refundable
+}
