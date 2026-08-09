@@ -3,14 +3,20 @@ from wave_client import WaveClient
 from processor import Processor
 import argparse
 import os
+import sys
 import config
 from idempotency import deterministic_external_id, content_hash, PostedLedger
 from logging_setup import setup_logging, get_logger
 from validation import validate_summary, validate_payloads
-from errors import ReconciliationError
+from errors import ReconciliationError, ValidationError, PipelineError
 import approval
 
 logger = get_logger()
+
+# Process exit codes (so an unattended/scheduled run surfaces failures):
+EXIT_OK = 0        # success, or a benign no-orders day
+EXIT_FAILURE = 1   # a day was aborted, refused, or failed to post
+EXIT_USAGE = 2     # bad or missing arguments / inputs
 
 
 def _post_payload_idempotent(wv, payload, ledger, replace=False):
@@ -116,6 +122,19 @@ def _post_payloads(wv, payloads, ledger, date_str, type_filter=None, replace=Fal
     return outcomes
 
 
+def _post_status(outcomes):
+    """
+    Map a posting outcomes dict to an exit code. A hard failure or a
+    changed-but-not-updated payload is non-zero so a scheduled run flags it;
+    posted / skipped-duplicate (idempotent re-run) are success.
+    """
+    if not outcomes:
+        return EXIT_OK
+    if outcomes.get("failed") or outcomes.get("skipped_changed"):
+        return EXIT_FAILURE
+    return EXIT_OK
+
+
 def post_approved(wv, artifact, ledger, type_filter=None, replace=False):
     """
     Post the payloads carried in an APPROVED artifact.
@@ -137,8 +156,12 @@ def post_approved(wv, artifact, ledger, type_filter=None, replace=False):
 def _fetch_aggregate_prepare(date_str):
     """
     Fetch a day from Square, aggregate, log the summary, validate, and prepare
-    Wave payloads. Returns (summary, payloads) or (None, None) if the day should
-    not proceed (no orders, unbalanced, or a blocking validation error).
+    Wave payloads.
+
+    Returns (summary, payloads) on success, or (None, None) for a benign
+    no-orders day. Raises ReconciliationError if the day won't balance, or
+    ValidationError if a blocking validation issue is found — so callers can
+    turn a real problem into a non-zero exit rather than a silent skip.
     """
     sq = SquareClient()
     orders = sq.fetch_orders(date_str, date_str)
@@ -160,11 +183,8 @@ def _fetch_aggregate_prepare(date_str):
 
     summary_errors, _ = validate_summary(summary)
 
-    try:
-        payloads = proc.prepare_wave_transactions(summary)
-    except ReconciliationError as e:
-        logger.error("Aborting %s: %s", date_str, e)
-        return None, None
+    # prepare_wave_transactions may raise ReconciliationError; let it propagate.
+    payloads = proc.prepare_wave_transactions(summary)
 
     payload_errors = validate_payloads(payloads)
     blocking = summary_errors + payload_errors
@@ -172,7 +192,8 @@ def _fetch_aggregate_prepare(date_str):
         logger.error("%d validation issue(s) found for %s: %s",
                       len(blocking), date_str, "; ".join(blocking))
         logger.error("Refusing to proceed with %s until the above are resolved.", date_str)
-        return None, None
+        raise ValidationError(f"{date_str}: {len(blocking)} validation issue(s): "
+                              + "; ".join(blocking))
 
     return summary, payloads
 
@@ -182,9 +203,15 @@ def _fetch_aggregate_prepare(date_str):
 # ---------------------------------------------------------------------------
 
 def run_dry_run(date_str):
-    summary, payloads = _fetch_aggregate_prepare(date_str)
+    # Dry run is an interactive preview, never a posting: surface problems in the
+    # log but don't fail the process over them.
+    try:
+        summary, payloads = _fetch_aggregate_prepare(date_str)
+    except PipelineError as e:
+        logger.error("Dry-run stopped for %s: %s", date_str, e)
+        return EXIT_OK
     if payloads is None:
-        return
+        return EXIT_OK
     logger.info("[DRY RUN] Would create the following Wave transactions:")
     for p in payloads:
         logger.info("Type: %s, Desc: %s, Amount: %s", p['type'], p['description'], p['amount'])
@@ -192,12 +219,13 @@ def run_dry_run(date_str):
             logger.info("   Anchor: %s (%s)", p['anchor_id'], p['anchor_direction'])
         for l in p['lines']:
             logger.info("   -> Line: %s $%s (Acct: %s)", l['direction'], l['amount'], l['account_id'])
+    return EXIT_OK
 
 
 def run_prepare(date_str, approval_file):
-    summary, payloads = _fetch_aggregate_prepare(date_str)
+    summary, payloads = _fetch_aggregate_prepare(date_str)   # may raise -> caught in main()
     if payloads is None:
-        return
+        return EXIT_OK
     artifact = approval.build_artifact(date_str, summary, payloads,
                                        location_id=config.SQUARE_LOCATION_ID)
     approval.write_artifact(approval_file, artifact)
@@ -206,45 +234,51 @@ def run_prepare(date_str, approval_file):
     logger.info("Prepared approval artifact -> %s (NOT approved, NOT posted).", approval_file)
     logger.info("Review it, then approve with:  --approve --approval-file %s", approval_file)
     logger.info("After approval, post with:      --post --approval-file %s", approval_file)
+    return EXIT_OK
 
 
 def run_approve(approval_file, approver):
     if not os.path.exists(approval_file):
         logger.error("Approval file not found: %s (run --prepare first).", approval_file)
-        return
+        return EXIT_USAGE
     artifact = approval.load_artifact(approval_file)
     ok, msg, artifact = approval.approve(artifact, approver)
     if not ok:
         logger.error("Cannot approve %s: %s", approval_file, msg)
-        return
+        return EXIT_FAILURE
     approval.write_artifact(approval_file, artifact)
     for line in approval.render_summary(artifact):
         logger.info(line)
     logger.info("Approved %s by %s. Post with:  --post --approval-file %s",
                 approval_file, artifact["approved_by"], approval_file)
+    return EXIT_OK
 
 
 def run_post(approval_file, ledger_path, type_filter, replace):
     if not os.path.exists(approval_file):
         logger.error("Approval file not found: %s (run --prepare and --approve first).", approval_file)
-        return
+        return EXIT_USAGE
     artifact = approval.load_artifact(approval_file)
     wv = WaveClient()
     ledger = PostedLedger(ledger_path)
     logger.info("--- Posting approved artifact %s to Wave ---", approval_file)
-    post_approved(wv, artifact, ledger, type_filter=type_filter, replace=replace)
+    outcomes = post_approved(wv, artifact, ledger, type_filter=type_filter, replace=replace)
+    if outcomes is None:   # gate rejected the artifact
+        return EXIT_FAILURE
+    return _post_status(outcomes)
 
 
 def run_force_oneshot(date_str, ledger_path, type_filter, replace):
     logger.warning("FORCE one-shot post for %s: bypassing the prepare-then-approve gate. "
                    "Use --prepare/--approve/--post for the audited path.", date_str)
-    summary, payloads = _fetch_aggregate_prepare(date_str)
+    summary, payloads = _fetch_aggregate_prepare(date_str)   # may raise -> caught in main()
     if payloads is None:
-        return
+        return EXIT_OK
     wv = WaveClient()
     ledger = PostedLedger(ledger_path)
     logger.info("--- Posting to Wave (force one-shot) ---")
-    _post_payloads(wv, payloads, ledger, date_str, type_filter=type_filter, replace=replace)
+    outcomes = _post_payloads(wv, payloads, ledger, date_str, type_filter=type_filter, replace=replace)
+    return _post_status(outcomes)
 
 
 def main():
@@ -297,24 +331,36 @@ def main():
 
     if mode in ("prepare", "dry-run", "force-oneshot") and not args.date:
         logger.error("--date is required for mode '%s'.", mode)
-        return
+        return EXIT_USAGE
     if mode in ("approve", "post") and not approval_file:
         logger.error("--approval-file (or --date to derive it) is required for mode '%s'.", mode)
-        return
+        return EXIT_USAGE
 
-    if mode == "dry-run":
-        run_dry_run(args.date)
-    elif mode == "prepare":
-        run_prepare(args.date, approval_file)
-    elif mode == "approve":
-        run_approve(approval_file, approver)
-    elif mode == "post":
-        run_post(approval_file, args.ledger, args.type, args.replace)
-    elif mode == "force-oneshot":
-        run_force_oneshot(args.date, args.ledger, args.type, args.replace)
+    try:
+        if mode == "dry-run":
+            code = run_dry_run(args.date)
+        elif mode == "prepare":
+            code = run_prepare(args.date, approval_file)
+        elif mode == "approve":
+            code = run_approve(approval_file, approver)
+        elif mode == "post":
+            code = run_post(approval_file, args.ledger, args.type, args.replace)
+        elif mode == "force-oneshot":
+            code = run_force_oneshot(args.date, args.ledger, args.type, args.replace)
+        else:
+            code = EXIT_OK
+    except PipelineError as e:
+        # Expected, typed failure (reconciliation/validation/etc.).
+        logger.error("Run failed for %s: %s", args.date, e)
+        code = EXIT_FAILURE
+    except Exception as e:
+        # Anything unexpected (network, auth, bad response) must still fail loudly.
+        logger.exception("Unexpected error during %s run for %s: %s", mode, args.date, e)
+        code = EXIT_FAILURE
 
-    logger.info("Run log written to %s", log_path)
+    logger.info("Run log written to %s (exit=%d)", log_path, code)
+    return code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

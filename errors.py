@@ -22,5 +22,9 @@ class ReconciliationError(PipelineError):
     """
 
 
+class ValidationError(PipelineError):
+    """Raised when a day fails pre-post validation and must not be posted."""
+
+
 class HttpError(PipelineError):
     """Raised when an HTTP call fails after exhausting retries (non-transient)."""
