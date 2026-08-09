@@ -32,7 +32,11 @@ def _post_payload_idempotent(wv, payload, ledger, replace=False):
     Returns one of: 'posted', 'skipped_duplicate', 'skipped_changed', 'failed'.
     """
     role = payload.get("role", payload.get("type"))
-    external_id = deterministic_external_id(role, config.SQUARE_LOCATION_ID, payload["date"])
+    # A payload may carry its own stable external id (e.g. one per Square payout,
+    # SQ_PAYOUT_<id>). Otherwise fall back to the per-(role, location, day) id used
+    # by the daily sales aggregates.
+    external_id = payload.get("external_id") or deterministic_external_id(
+        role, config.SQUARE_LOCATION_ID, payload["date"])
     new_hash = content_hash(payload)
 
     existing = ledger.find(external_id)

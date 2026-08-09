@@ -76,3 +76,48 @@ def post_with_retry(url, *, json=None, headers=None, timeout=DEFAULT_TIMEOUT,
     if last_exc:
         raise last_exc
     raise RuntimeError("post_with_retry exhausted attempts unexpectedly")
+
+
+def get_with_retry(url, *, params=None, headers=None, timeout=DEFAULT_TIMEOUT,
+                   max_retries=DEFAULT_MAX_RETRIES, backoff_base=DEFAULT_BACKOFF_BASE,
+                   sleep=time.sleep, getter=None):
+    """
+    GET ``url`` with a timeout and bounded retry/backoff on transient failures.
+
+    Mirror of ``post_with_retry`` for the read APIs (e.g. Square Payouts).
+
+    :param getter: callable like ``requests.get``; defaults to ``requests.get``.
+    :returns: the final ``requests.Response``.
+    :raises requests.exceptions.RequestException: if every attempt raised a
+        transport-level error.
+    """
+    do_get = getter or requests.get
+    attempt = 0
+    last_exc = None
+    while attempt <= max_retries:
+        attempt += 1
+        try:
+            resp = do_get(url, params=params, headers=headers, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt > max_retries:
+                logger.error("GET %s failed after %d attempt(s): %s", url, attempt, e)
+                raise
+            delay = backoff_base * (2 ** (attempt - 1))
+            logger.warning("GET %s transient transport error (attempt %d/%d): %s; retrying in %.1fs",
+                           url, attempt, max_retries + 1, e, delay)
+            sleep(delay)
+            continue
+
+        if resp.status_code in RETRYABLE_STATUS and attempt <= max_retries:
+            delay = backoff_base * (2 ** (attempt - 1))
+            logger.warning("GET %s -> HTTP %d (attempt %d/%d); retrying in %.1fs",
+                           url, resp.status_code, attempt, max_retries + 1, delay)
+            sleep(delay)
+            continue
+
+        return resp
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("get_with_retry exhausted attempts unexpectedly")
