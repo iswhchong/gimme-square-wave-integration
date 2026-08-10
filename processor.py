@@ -389,9 +389,9 @@ class Processor:
                 "anchor_direction": "DEPOSIT", 
                 "amount": cash_amt,
                 "lines": [{
-                    "account_id": self.account_map['tee_time'], # Workaround Placeholder
+                    "account_id": self.account_map['transfer_suspense'], # Uncategorized Income placeholder; re-point to Square - A/R in Wave
                     "amount": cash_amt,
-                    "direction": "INCREASE" # Credit Revenue
+                    "direction": "INCREASE" # Credit
                 }]
             })
             
