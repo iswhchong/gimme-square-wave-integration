@@ -94,3 +94,55 @@ PAYOUT_ACCOUNTS = {
     # Recoverable GST (Input Tax Credit) on the gift-card fee (asset).
     "itc": "QWNjb3VudDoxOTMzNjkxNDI2NzcyNjY5MjIwO0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Taxes Recoverable/Refundable
 }
+
+
+# --- Workstream 3: CIBC Credit-card spending -> Wave -------------------------
+# Posts business card charges as expenses, anchored on the CIBC Credit Card
+# liability. Posts cleanly via API (credit-card = valid anchor, expenses = valid
+# lines). GST is posted GROSS (no per-transaction split). Charges Kent can't map
+# by merchant land in "Uncategorized Expense" for him to split; card payments land
+# in "Uncategorized Income" for him to re-point to "Transfer from Cash on Hand".
+CC_ACCOUNTS = {
+    "card": "QWNjb3VudDoyMjA1MzI1NTAwOTM3NzIwNjgwO0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # CIBC Credit Card (liability, anchor)
+    "alcohol": "QWNjb3VudDoyMzAwOTUwOTIxNTE0ODk4MDIxO0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Inventory Expense - Alcohol
+    "subscription": "QWNjb3VudDoyMDgwMzExNTQyNjk1MzgzMTk4O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Subscription Expense
+    "advertising": "QWNjb3VudDoxOTMzNjkxNDI3OTcyMjQwMjIyO0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Advertising & Promotion
+    "telephone_wireless": "QWNjb3VudDoxOTMzNjkxNDI3NTc3OTc1NjI2O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Telephone - Wireless (Zoom)
+    "computer_internet": "QWNjb3VudDoxOTMzNjkxNDI3NDM1MzY5Mjg0O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Computer - Internet (Telus)
+    "golf_supplies": "QWNjb3VudDoyMzAwNjgzNDM0Mzk5NDIxMzQ0O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Golf Supplies (Taobao)
+    "office_supplies": "QWNjb3VudDoxOTMzNjkxNDI3Njg3MDI3NTM2O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Office Supplies (Best Buy)
+    "insurance": "QWNjb3VudDoyMDQ0MTMxMzg5NTI3MzQ3ODc1O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Insurance Expense (WCB)
+    "business_licenses": "QWNjb3VudDoxOTMzNjkxNDI3NjUzNDczMTAyO0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Business Licenses & Permits
+    # Wave's built-in Uncategorized accounts (ambiguous charges / card-payment placeholder).
+    "uncategorized_expense": "QWNjb3VudDoxOTMzNjkxNDI3MTUwMTU2NTk4O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Uncategorized Expense
+    "uncategorized_income": "QWNjb3VudDoxOTMzNjkxNDI3MDA3NTUwMjU2O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",   # Uncategorized Income
+}
+
+# Merchant keyword -> account key. First match wins (put specifics first). Matched
+# case-insensitively against the raw CIBC merchant text. Anything unmatched falls
+# back to 'uncategorized_expense'. Derived from 186 historical Wave postings.
+CC_MERCHANT_RULES = [
+    # Alcohol (liquor / breweries / distilleries)
+    ("LIQUOR", "alcohol"), ("BREWING", "alcohol"), ("DISTILL", "alcohol"),
+    ("SEA CHANGE", "alcohol"), ("ALLEY KAT", "alcohol"), ("SHIDDY", "alcohol"),
+    ("MALTS & GRAIN", "alcohol"), ("MALT & GRAIN", "alcohol"), ("SYC BREW", "alcohol"),
+    ("HENNESSY", "alcohol"), ("HENESSY", "alcohol"), ("SOJU", "alcohol"), ("SAPPORO", "alcohol"),
+    # Subscriptions / software
+    ("SPOTIFY", "subscription"), ("SPORTIFY", "subscription"), ("CANVA", "subscription"),
+    ("TELSCO", "subscription"), ("WAVE - PAYROLL", "subscription"), ("WAVE-PAYROLL", "subscription"),
+    ("PAYROLL FEE", "subscription"), ("WIX", "subscription"), ("ASK BENNY", "subscription"),
+    ("AMAZON PRIME", "subscription"), ("AMZN PRIME", "subscription"),
+    ("PRIME MEMBERSHIP", "subscription"), ("AMAZON CHANNEL", "subscription"),
+    # Advertising
+    ("FACEBK", "advertising"), ("FACEBOOK", "advertising"), ("BEST VERSION MEDIA", "advertising"),
+    # Utilities / comms
+    ("ZOOM", "telephone_wireless"), ("TELUS", "computer_internet"),
+    # Golf / office / insurance / licenses
+    ("TAOBAO", "golf_supplies"), ("BEST BUY", "office_supplies"), ("WCB", "insurance"),
+    ("CALLINGWOOD REGISTRIES", "business_licenses"), ("PROSERVE", "business_licenses"),
+    ("FOOD PERMIT", "business_licenses"),
+]
+
+# A col-4 (money-in) row is a CARD PAYMENT (not a merchant refund) if its
+# description contains any of these.
+CC_PAYMENT_KEYWORDS = ["PRE-AUTHORIZED PAYMENT", "PRE-AUTH PAYMENT", "THANK YOU"]
