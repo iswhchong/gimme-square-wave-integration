@@ -9,6 +9,12 @@ SQUARE_LOCATION_ID = os.getenv("SQUARE_LOCATION_ID")
 WAVE_ACCESS_TOKEN = os.getenv("WAVE_ACCESS_TOKEN")
 WAVE_BUSINESS_ID = os.getenv("WAVE_BUSINESS_ID")
 
+# Wave's built-in "Uncategorized Income" account. Used as the single, easy-to-spot
+# suspense/placeholder for every "needs re-pointing to a transfer" line — the
+# payout transfer, the daily cash transfer, and credit-card payments all land here
+# so they're trivial to find and follow up in the Wave portal.
+UNCATEGORIZED_INCOME_ID = "QWNjb3VudDoxOTMzNjkxNDI3MDA3NTUwMjU2O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA=="
+
 # Account Mapping (Wave Account IDs)
 # Account Mapping (Wave Account IDs)
 ACCOUNT_MAPPING = {
@@ -23,7 +29,11 @@ ACCOUNT_MAPPING = {
     # Other Liabilities
     "gift_card": "QWNjb3VudDoyMDgyMDk2Mzk4MDg1NDQ0MjQzO0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==", # Liability - Gimme Gift Card
     
-    # Placeholder for Transfer Workaround
+    # Placeholder for the daily cash-transfer workaround. Now points to
+    # Uncategorized Income (was Tee Time) so it's easy to spot and re-point to
+    # "Transfer from Square - Account Receivable" in Wave.
+    "transfer_suspense": UNCATEGORIZED_INCOME_ID,  # Uncategorized Income (placeholder)
+    # Real Tee Time (Sales) account — kept for reference; no longer the transfer placeholder.
     "tee_time": "QWNjb3VudDoyMDgyMTAxODMxMDAwOTY5NTIzO0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==", # Tee Time (Sales) - ...523
     
     # Expenses/Contra
@@ -84,9 +94,9 @@ PAYOUT_ACCOUNTS = {
     # Bank account the payout cash lands in (asset, anchor / Deposit).
     "bank": "QWNjb3VudDoxOTMzNjkxNDI2NjM4NDUxNDg4O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Cash on Hand
     # SUSPENSE placeholder for the "Transfer from Square - A/R" line (Kent edits
-    # this to the real transfer). Defaults to Tee Time (income), the same
-    # placeholder Phase 1 uses for its transfer workaround. Change freely.
-    "suspense": ACCOUNT_MAPPING["tee_time"],  # Tee Time (income) — placeholder only
+    # this to the real transfer). Uncategorized Income, so it's easy to spot and
+    # follow up in Wave (shared with the daily cash transfer + card payments).
+    "suspense": UNCATEGORIZED_INCOME_ID,  # Uncategorized Income — placeholder only
     # Credit-card processing fee (expense, GST-exclusive).
     "cc_fee": "QWNjb3VudDoyMDgyMTA3NDI1NzU3OTA5ODQ5O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Square Transaction Fee
     # Gift-card processing fee, NET of GST (expense).
@@ -115,7 +125,7 @@ CC_ACCOUNTS = {
     "business_licenses": "QWNjb3VudDoxOTMzNjkxNDI3NjUzNDczMTAyO0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Business Licenses & Permits
     # Wave's built-in Uncategorized accounts (ambiguous charges / card-payment placeholder).
     "uncategorized_expense": "QWNjb3VudDoxOTMzNjkxNDI3MTUwMTU2NTk4O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Uncategorized Expense
-    "uncategorized_income": "QWNjb3VudDoxOTMzNjkxNDI3MDA3NTUwMjU2O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",   # Uncategorized Income
+    "uncategorized_income": UNCATEGORIZED_INCOME_ID,   # Uncategorized Income
 }
 
 # Merchant keyword -> account key. First match wins (put specifics first). Matched
