@@ -92,7 +92,7 @@ ROUNDING_TOLERANCE = 0.05
 # in Wave. Everything else (fees + GST) posts correctly and needs no adjustment.
 PAYOUT_ACCOUNTS = {
     # Bank account the payout cash lands in (asset, anchor / Deposit).
-    "bank": "QWNjb3VudDoxOTMzNjkxNDI2NjM4NDUxNDg4O0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Cash on Hand
+    "bank": "QWNjb3VudDoyNTk4ODc3MzYzMDA5ODAyNjcwO0J1c2luZXNzOmI4YzZhMjZjLTYxZTYtNGU5OS05M2Q3LTA4ZDk4OWE4M2U3ZA==",  # Wealthsimple
     # SUSPENSE placeholder for the "Transfer from Square - A/R" line (Kent edits
     # this to the real transfer). Uncategorized Income, so it's easy to spot and
     # follow up in Wave (shared with the daily cash transfer + card payments).
