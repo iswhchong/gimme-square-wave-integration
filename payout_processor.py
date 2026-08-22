@@ -8,7 +8,7 @@ default Tee Time). Kent then re-points that one line to "Transfer from Square -
 Account Receivable" in Wave and fixes the actual settlement date. Everything else
 posts correctly:
 
-    Bank (Cash on Hand)                  <- net (amount_money)   [anchor DEPOSIT]
+    Bank (Wealthsimple)                  <- net (amount_money)   [anchor DEPOSIT]
     Suspense (placeholder for transfer)  <- released             [INCREASE = credit]
     Square Transaction Fee (CC fee)      <- Σ fee_amount_money    [INCREASE = debit]
     Square - Gift Card Fee (net of GST)  <- −Σ OTHER.gross        [INCREASE = debit]
